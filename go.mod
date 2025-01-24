@@ -1,3 +1,3 @@
-module github.com/jupitters/chirpy.git
+module github.com/jupitters/chirpy
 
 go 1.23.4
