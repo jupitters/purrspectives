@@ -1,33 +1,44 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	"github.com/jupitters/chirpy/internal/database"
+	_ "github.com/lib/pq"
 )
 
+type User struct {
+    ID uuid.UUID `json:"id"`
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+    Email string `json:"email"`
+}
+type Chirp struct {
+    ID uuid.UUID `json:"id"`
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+    Body string `json:"body"`
+    User_ID uuid.UUID `json:"user_id"`
+}
 type apiConfig struct {
     fileserverHits atomic.Int32
-}
-type ChirpRequest struct {
-    Body string `json:"body"`
-}
-type ErrorRequest struct {
-    Error string `json:"error"`
-}
-type ValidRequest struct {
-    Valid string `json:"valid"`
-}
-type CleanedResponse struct {
-    CleanedBody string `json:"cleaned_body"`
+    DB *database.Queries
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
         cfg.fileserverHits.Add(1)
+        log.Printf("%s %s %s", req.Method, req.URL.Path, req.Header)
         next.ServeHTTP(w, req)
     })
 }
@@ -40,15 +51,14 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
         return
     }
     
-    w.Header().Add("Type-Content", "application/json")
+    w.Header().Add("Content-Type", "application/json")
     w.WriteHeader(code)
     w.Write(dat)
 }
 
 func respondWithError(w http.ResponseWriter, code int, msg string) {
-    if code > 499 {
-        respondWithJSON(w, 500, "Erro no servidor!")
-        return
+    type ErrorRequest struct {
+        Error string `json:"error"`
     }
     
     respondWithJSON(w, code, ErrorRequest{
@@ -67,17 +77,23 @@ func (cfg *apiConfig) requestNumber(w http.ResponseWriter, req *http.Request) {
                     </html>`, cfg.fileserverHits.Load())
 }
 
-func (cfg *apiConfig) resetNumber(w http.ResponseWriter, req *http.Request) {
-    cfg.fileserverHits.Store(0)
+func (apiCfg *apiConfig) cleanAll(w http.ResponseWriter, req *http.Request) {
+    apiCfg.fileserverHits.Store(0)
     w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-    w.WriteHeader(http.StatusOK)
-}
 
-func middlewareLog(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-        log.Printf("%s %s", req.Method, req.URL.Path)
-        next.ServeHTTP(w, req)
-    })
+    platform := os.Getenv("PLATFORM")
+    if platform != "dev" {
+        respondWithError(w, http.StatusForbidden, "Acesso proibido!")
+        return
+    }
+
+    err := apiCfg.DB.DeleteAllUsers(req.Context())
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Não foi possivel resetar o banco de dados. %v", err))
+        return
+    }
+
+    respondWithJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 func cleanedChirpBody(body string) string {
@@ -101,11 +117,16 @@ func cleanedChirpBody(body string) string {
     return strings.Join(words, " ")
 }
 
-func validateChirpH(w http.ResponseWriter, req *http.Request) {
-    var chirpReq ChirpRequest
+func (apiCfg *apiConfig) handlerChirp(w http.ResponseWriter, req *http.Request) {
+    type ChirpRequest struct {
+        Body string `json:"body"`
+        User_ID uuid.UUID `json:"user_id"`
+    }
+
+    chirpReq := ChirpRequest{}
     err := json.NewDecoder(req.Body).Decode(&chirpReq)
-    if err != nil || chirpReq.Body == "" {
-        respondWithError(w, http.StatusBadRequest, "Algo deu errado!")
+    if err != nil || chirpReq.Body == ""  || chirpReq.User_ID == uuid.Nil{
+        respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Algo deu errado na requisição! %v", err))
         return
     }
 
@@ -114,31 +135,86 @@ func validateChirpH(w http.ResponseWriter, req *http.Request) {
         return
     }
 
-    //json.NewEncoder(w).Encode(ValidRequest{Valid: "true"})
+    chirpReq.Body = cleanedChirpBody(chirpReq.Body)
 
-    cleanedBody := cleanedChirpBody(chirpReq.Body)
+    chirp, err := apiCfg.DB.CreateChirp(req.Context(), database.CreateChirpParams{
+        Body: chirpReq.Body,
+        UserID: chirpReq.User_ID,
+    })
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Não foi possivel criar o chirp: %v", err))
+    }
 
-    respondWithJSON(w, 200, CleanedResponse{CleanedBody: cleanedBody})
+    respondWithJSON(w, http.StatusCreated, Chirp{
+        ID: chirp.ID,
+        CreatedAt: chirp.CreatedAt,
+        UpdatedAt: chirp.UpdatedAt,
+        Body: chirp.Body,
+        User_ID: chirp.UserID,
+    })
+}
+
+func (apiCfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request) {
+    type parameters struct {
+        Email string `json:"email"`
+    }
+
+    params := parameters{}
+    err := json.NewDecoder(req.Body).Decode(&params)
+    if err != nil {
+        respondWithError(w, 400, fmt.Sprintf("Erro no JSON: %v", err))
+        return
+    }
+    if params.Email == ""{
+        respondWithError(w, http.StatusBadRequest, "Email não pode ser vazio.")
+        return
+    }
+
+    user, err := apiCfg.DB.CreateUser(req.Context(), params.Email)
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Não foi possivel criar o usuario: %v", err))
+        return
+    }
+
+    respondWithJSON(w, http.StatusCreated, User{
+        ID: user.ID,
+        CreatedAt: user.CreatedAt,
+        UpdatedAt: user.UpdatedAt,
+        Email: user.Email,
+    })   
 }
 
 func main() {
+    godotenv.Load()
     host := "localhost"
-    port := "8080"
+    port := os.Getenv("PORT")
 
+    dbURL := os.Getenv("DB_URL")
+    if dbURL == "" {
+        log.Fatal("Não foi possivel acessar o banco de dados.")
+    }
+
+    db, err := sql.Open("postgres", dbURL)
+    if err != nil {
+        log.Fatal("Erro ao abrir o banco de dados", err)
+    }
+
+    apiCfg := apiConfig {
+        DB: database.New(db),
+    }
+    
     mux := http.NewServeMux()
     server := &http.Server{
         Addr: ":" + port,
         Handler: mux,
     }
 
-    apiCfg := apiConfig{}
-
-    mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
-    mux.Handle("/assets/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir("/assets")))))
+    mux.Handle("/app", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
+    mux.Handle("/assets", apiCfg.middlewareMetricsInc(http.FileServer(http.Dir("/assets"))))
     mux.HandleFunc("GET /admin/metrics", apiCfg.requestNumber)
-    mux.HandleFunc("POST /admin/reset", apiCfg.resetNumber)
-    mux.HandleFunc("POST /api/validate_chirp", validateChirpH)
-    
+    mux.HandleFunc("POST /admin/reset", apiCfg.cleanAll)
+    mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+    mux.HandleFunc("POST /api/chirps", apiCfg.handlerChirp)
 
     mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, req *http.Request){
         w.Header().Set("Content-Type", "text/plain; charset=utf-8")
