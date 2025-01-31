@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/jupitters/chirpy/internal/auth"
 	"github.com/jupitters/chirpy/internal/database"
 	_ "github.com/lib/pq"
 )
@@ -154,9 +155,54 @@ func (apiCfg *apiConfig) handlerChirp(w http.ResponseWriter, req *http.Request) 
     })
 }
 
+func (apiCfg *apiConfig) handlerGetChirps(w http.ResponseWriter, req *http.Request) {
+    chirp, err := apiCfg.DB.GetChirps(req.Context())
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "Erro ao recuperar chirps!")
+        return
+    }
+
+    chirps := []Chirp{}
+    for _, item := range chirp {
+        chirps = append(chirps, Chirp{
+            ID: item.ID,
+            CreatedAt: item.CreatedAt,
+            UpdatedAt: item.UpdatedAt,
+            Body: item.Body,
+            User_ID: item.UserID,
+        })
+    }
+
+    respondWithJSON(w, http.StatusOK, chirps)
+}
+
+func (apiCfg *apiConfig) handlerGetChirpById(w http.ResponseWriter, req *http.Request) {
+    chirpId, err := uuid.Parse(req.PathValue("chirpID"))
+    if err != nil {
+        respondWithError(w, http.StatusBadRequest, "ID inválido")
+        return
+    }
+
+    chirp, err := apiCfg.DB.GetChirpByID(req.Context(), chirpId)
+    if err != nil {
+        respondWithError(w, http.StatusNotFound, "Chirp não encontrado")
+        return
+    }
+
+    respondWithJSON(w, http.StatusOK, Chirp{
+        ID: chirp.ID,
+        CreatedAt: chirp.CreatedAt,
+        UpdatedAt: chirp.UpdatedAt,
+        Body: chirp.Body,
+        User_ID: chirp.UserID,
+    })
+
+}
+
 func (apiCfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request) {
     type parameters struct {
         Email string `json:"email"`
+        Password string `json:"password"`
     }
 
     params := parameters{}
@@ -165,12 +211,25 @@ func (apiCfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Requ
         respondWithError(w, 400, fmt.Sprintf("Erro no JSON: %v", err))
         return
     }
-    if params.Email == ""{
+    if params.Email == "" {
         respondWithError(w, http.StatusBadRequest, "Email não pode ser vazio.")
         return
     }
+    if params.Password == "" {
+        respondWithError(w, http.StatusBadRequest, "Senha não pode ser vazia.")
+        return
+    }
 
-    user, err := apiCfg.DB.CreateUser(req.Context(), params.Email)
+    params.Password, err = auth.HashPassword(params.Password)
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "Erro ao criar o hash da senha.")
+        return
+    }
+
+    user, err := apiCfg.DB.CreateUser(req.Context(), database.CreateUserParams{
+        Email: params.Email,
+        HashedPassword: params.Password,
+    })
     if err != nil {
         respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Não foi possivel criar o usuario: %v", err))
         return
@@ -214,7 +273,11 @@ func main() {
     mux.HandleFunc("GET /admin/metrics", apiCfg.requestNumber)
     mux.HandleFunc("POST /admin/reset", apiCfg.cleanAll)
     mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+    
     mux.HandleFunc("POST /api/chirps", apiCfg.handlerChirp)
+    mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
+    mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpById)
+    
 
     mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, req *http.Request){
         w.Header().Set("Content-Type", "text/plain; charset=utf-8")
