@@ -23,6 +23,7 @@ type User struct {
     CreatedAt time.Time `json:"created_at"`
     UpdatedAt time.Time `json:"updated_at"`
     Email string `json:"email"`
+    Token string `json:"token,omitempty"`
 }
 type Chirp struct {
     ID uuid.UUID `json:"id"`
@@ -34,6 +35,7 @@ type Chirp struct {
 type apiConfig struct {
     fileserverHits atomic.Int32
     DB *database.Queries
+    JWTSecret string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -121,12 +123,23 @@ func cleanedChirpBody(body string) string {
 func (apiCfg *apiConfig) handlerChirp(w http.ResponseWriter, req *http.Request) {
     type ChirpRequest struct {
         Body string `json:"body"`
-        User_ID uuid.UUID `json:"user_id"`
+    }
+
+    token, err := auth.GetBearerToken(req.Header)
+    if err != nil {
+        respondWithError(w, http.StatusUnauthorized, fmt.Sprintf("%v", err))
+        return
+    }
+
+    userID, err := auth.ValidateJWT(token, apiCfg.JWTSecret)
+    if err != nil {
+        respondWithError(w, http.StatusUnauthorized, "Não autorizado.")
+        return
     }
 
     chirpReq := ChirpRequest{}
-    err := json.NewDecoder(req.Body).Decode(&chirpReq)
-    if err != nil || chirpReq.Body == ""  || chirpReq.User_ID == uuid.Nil{
+    err = json.NewDecoder(req.Body).Decode(&chirpReq)
+    if err != nil || chirpReq.Body == "" {
         respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Algo deu errado na requisição! %v", err))
         return
     }
@@ -140,7 +153,7 @@ func (apiCfg *apiConfig) handlerChirp(w http.ResponseWriter, req *http.Request) 
 
     chirp, err := apiCfg.DB.CreateChirp(req.Context(), database.CreateChirpParams{
         Body: chirpReq.Body,
-        UserID: chirpReq.User_ID,
+        UserID: userID,
     })
     if err != nil {
         respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Não foi possivel criar o chirp: %v", err))
@@ -243,10 +256,63 @@ func (apiCfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Requ
     })   
 }
 
+func (apiCfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
+    type parameters struct {
+        Email string `json:"email"`
+        Password string `json:"password"`
+        ExpiresInSeconds int `json:"expires_in_seconds"`
+    }
+
+    login := parameters{}
+    err := json.NewDecoder(req.Body).Decode(&login)
+    if err != nil {
+        respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Erro no JSON: %v", err))
+        return
+    }
+
+    user, err := apiCfg.DB.GetUserByEmail(req.Context(), login.Email)
+    if err != nil {
+        respondWithError(w, http.StatusNotFound, "Email não encontrado")
+        return
+    }
+
+    err = auth.CheckPasswordHash(login.Password, user.HashedPassword)
+    if err != nil {
+        respondWithError(w, http.StatusUnauthorized, "Email ou senha incorretos.")
+        return
+    }
+
+    expiresIn := time.Hour
+    if login.ExpiresInSeconds > 0 {
+        expiresIn = time.Duration(login.ExpiresInSeconds) * time.Second
+        if expiresIn > time.Hour {
+            expiresIn = time.Hour
+        }
+    }
+
+    token, err := auth.MakeJWT(user.ID, apiCfg.JWTSecret, expiresIn)
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "Falha ao criar token")
+    }
+
+    respondWithJSON(w, http.StatusOK, User{
+        ID: user.ID,
+        CreatedAt: user.CreatedAt,
+        UpdatedAt: user.UpdatedAt,
+        Email: user.Email,
+        Token: token,
+    })
+}
+
 func main() {
     godotenv.Load()
     host := "localhost"
     port := os.Getenv("PORT")
+    jwtSecret := os.Getenv("JWT_SECRET")
+
+    if jwtSecret == "" {
+        log.Fatal("Não foi possivel localizar JWT_SECRET em .env")
+    }
 
     dbURL := os.Getenv("DB_URL")
     if dbURL == "" {
@@ -260,6 +326,7 @@ func main() {
 
     apiCfg := apiConfig {
         DB: database.New(db),
+        JWTSecret: jwtSecret,
     }
     
     mux := http.NewServeMux()
@@ -273,12 +340,10 @@ func main() {
     mux.HandleFunc("GET /admin/metrics", apiCfg.requestNumber)
     mux.HandleFunc("POST /admin/reset", apiCfg.cleanAll)
     mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
-    
+    mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
     mux.HandleFunc("POST /api/chirps", apiCfg.handlerChirp)
     mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
     mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpById)
-    
-
     mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, req *http.Request){
         w.Header().Set("Content-Type", "text/plain; charset=utf-8")
         w.WriteHeader(http.StatusOK)
