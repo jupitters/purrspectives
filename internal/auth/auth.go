@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -70,6 +72,30 @@ func GetBearerToken(headers http.Header) (string, error) {
 	parts := strings.Fields(tokenAuth)
 	if parts[0] != "Bearer" || len(parts) != 2 {
 		return "", errors.New("erro na formação do header de autorização")
+	}
+
+	return parts[1], nil
+}
+
+func MakeRefreshToken() (string, error) {
+	bytes := make([]byte, 32)
+	_, err := rand.Read(bytes)
+	if err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(bytes), nil
+}
+
+func GetAPIKey(headers http.Header) (string, error) {
+	tokenAuth := headers.Get("Authorization")
+	if tokenAuth == ""{
+		return "", errors.New("sem header de autorização")
+	}
+
+	parts := strings.Fields(tokenAuth)
+	if parts[0] != "ApiKey" || len(parts) != 2 {
+		return "",  errors.New("erro na formação do header de autorização")
 	}
 
 	return parts[1], nil
